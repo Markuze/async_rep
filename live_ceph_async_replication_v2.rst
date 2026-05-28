@@ -11,7 +11,7 @@ in the client-to-cluster path copies MDS and OSD traffic in both directions.
 A translation gateway decodes that traffic, maintains source-side
 inode-to-path and layout state, and emits an ordered stream of path-based
 filesystem operations. A remote libceph client backend applies that stream
-to the replica, which converges to the source's POSIX-visible state.
+to the replica, which converges to the source's committed state.
 
 This is the inverse of NFS-Ganesha. Ganesha accepts NFS/SMB protocol
 operations and translates them into CephFS client operations; this design
@@ -26,6 +26,11 @@ not depend on the order in which packets are observed. The POC proves the
 hard half of the pipeline: that the gateway can derive a correct, ordered
 ``path + op`` stream from wire traffic. Replay through a libceph backend is
 the straightforward half.
+
+The live capture-and-replay mechanism needs no changes to Ceph clients,
+OSDs, or MDS; the only optional cluster change is a small MDS quarantine
+feature used by one bootstrap strategy (Strategy A), which the alternative
+(Strategy B) avoids entirely.
 
 Introduction
 ------------
@@ -68,7 +73,17 @@ The POC demonstrates that the system can:
 * feed the ordered operation stream to a remote libceph client backend;
 * bootstrap a pre-existing subtree into the replicated state, including
   table seeding and the bootstrap-to-live-capture seam;
-* converge the replica to the source's POSIX-visible state.
+* converge the replica to the source's state (defined next).
+
+*Convergence* is the proof target. After the replay stream drains on a
+quiesced source, the replica's namespace, file content, and attributes —
+mode, owner, xattrs, size, nlink, and symlink target — equal the source's
+actual committed state. Timestamps (mtime, atime, ctime) are not preserved,
+as expected for asynchronous disaster-recovery replication. Stating the
+target as the source's *actual* committed state also settles the cross-object
+case: where simultaneous writers tear a write across an object boundary,
+CephFS itself is not atomic and the replica reproduces whatever the source
+committed.
 
 Assumptions
 -----------
@@ -108,9 +123,11 @@ F2. Inode-to-path translation bridges MDS and OSD traffic
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 MDS traffic is namespace-oriented (path, parent inode, dentry name); OSD
-traffic is object-oriented (source-local inode, object number, offset,
-length, payload). The source-local inode is the join key, so the gateway
-maintains an inode-to-path model:
+traffic is object-oriented. A CephFS data object is named
+``<inode-hex>.<objno-hex>`` (e.g. ``10000000abc.00000004``), so the
+source-local inode and object number are read directly off the object name —
+the join key is on the wire, not inferred. The source-local inode is that
+join key, so the gateway maintains an inode-to-path model:
 
 ::
 
@@ -139,11 +156,19 @@ logical file extents and emits:
 The replica need not share the source's layout: the translation targets
 logical file offsets, not target RADOS objects.
 
+The gateway learns a file's layout from the MDS create reply and treats it as
+immutable once the file holds data; a layout set via the ``ceph.*.layout``
+xattr on an empty file before its first write updates ``layout_table`` too, so
+the stripe math never runs on a stale layout.
+
 F4. Correct order is derived from source tokens before replay
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The gateway merges MDS-derived metadata events and OSD-derived data events
-into one order. That order is reconstructed from source-assigned sequence
+The order recovered here is well-defined only because the source has already
+serialized conflicting operations — the cap foundation established in F6
+below. Given that, the gateway merges MDS-derived metadata events and
+OSD-derived data events into one order. That order is reconstructed from
+source-assigned sequence
 tokens carried in the wire messages, not from observation order. Because a
 file is striped across many objects on many OSDs over many connections, even
 one client writing one file produces parallel streams with no inherent
@@ -169,6 +194,13 @@ The ordering tokens:
 The gateway joins a request's ``truncate_seq`` to a reply's ``user_version``
 on the op ``reqid``/``tid`` — the same request/reply correlation that strict
 capture already performs.
+
+Replaying an object's writes in ``user_version`` order therefore reproduces
+that object's exact final bytes — ``user_version`` *is* the source's commit
+order for that object — and per-object equality, with the object-to-file
+offset mapping of F3, gives whole-file equality. Because the gateway keys on
+committed OSD writes, logical writes a client buffered and coalesced away
+never entered the source's durable state and so need not be replayed.
 
 F5. The remote side stays simple
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -208,11 +240,6 @@ reproduces the handoff order directly. The same holds when multiple writers
 force the filelock to LOCK_MIX and Fb is revoked from all of them: writes
 become synchronous and the OSD assigns ``user_version`` in commit order,
 which the gateway recovers from the replies.
-
-For writes that cross object boundaries from simultaneous writers, CephFS
-itself does not guarantee POSIX atomicity. The replica receives whatever
-interleaving the source produced, so convergence is to the source's actual
-behavior.
 
 Architecture
 ------------
@@ -352,7 +379,6 @@ Replay record shape
    truncate_seq        # truncate-vs-write order key
    op_id               # source-session op id (OSD reqid / MDS tid)
    args                # mode, uid/gid, xattr, offset, length, payload, size
-   ack_state           # observed, confirmed, dropped
 
 The backend applies ``op``, ``path``, and ``args``, and uses the tokens to
 order and dedupe per object/inode. Source-local inode, object, and layout
@@ -504,19 +530,9 @@ the replica hold a write the source later loses on OSD failover or peering.
 The ``user_version`` the gateway orders on arrives in that same commit reply,
 so confirmation and ordering token arrive together.
 
-The capture layer stands inline over TCP between the source daemons and the
-world: the same stream that delivers a byte to its destination delivers the
-copy to the gateway, so absent implementation bugs nothing is lost on the
-wire. The POC asserts this — per-collector stream contiguity and per-object
-``user_version`` continuity are checked, and any discontinuity is an alarm,
-not a tolerated condition.
-
-.. warning::
-
-   Strict head-of-queue confirmation can stall a per-inode queue if a
-   ``Confirmed`` reply is never matched to its event — a parse or
-   correlation bug, since inline TCP rules out wire loss. The POC
-   asserts/alarms on a stalled head rather than blocking silently.
+Capture is inline with the source's TCP stream, so a collector observes every
+byte its daemon does: capture is lossless by construction, and the design
+carries no capture-loss-recovery machinery.
 
 Ordering domains
 ~~~~~~~~~~~~~~~~~
@@ -526,12 +542,16 @@ per-file data and size operations; same-inode metadata operations; namespace
 operations on the same path or parent directory; and rename/link/unlink
 operations that change the inode-to-path table.
 
-Rename against in-flight writes needs no replay-time coupling. A rename's
-path-table update is ordered by its source token, and a write resolves the
-inode's current path when it is emitted. Because the source committed the
-rename before any later write — so the write carries a higher per-session op
-id for that client — the gateway orders the rename first, updates the table
-first, and the later write resolves to the new path.
+Rename against in-flight writes needs no replay-time coupling, because a
+rename and a write to the same inode commute for convergence: the write
+targets the inode's objects regardless of the inode's current name, and the
+rename relocates the inode together with its data, so the replica converges
+whichever the gateway emits first — including across clients. The mechanism
+that realizes this is path resolution at emit time: a write names only an
+inode, so the gateway resolves it to the inode's current path against the
+table as it emits the record, while a rename updates that table. Competing
+namespace operations on the same name are ordered by the MDS journal
+sequence.
 
 Size-affecting operations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -544,50 +564,21 @@ gateway already captures, together with the MDS ``setattr(size)`` reply. No
 visibility into the MDS-issued ``CEPH_OSD_OP_TRIMTRUNC`` (which travels
 MDS-to-OSD on the cluster network) is required.
 
-The gateway serializes size-affecting operations per source-local inode in a
-queue ordered by ``truncate_seq`` (and by ``user_version`` within a
-``truncate_seq`` epoch). Size-affecting operations are ``OSD_OP_WRITE``,
-``OSD_OP_WRITEFULL``, ``OSD_OP_TRUNCATE``, ``OSD_OP_ZERO``, and MDS
-``setattr`` with ``size`` set.
-
-Each queue entry is tracked as Observed (parsed and ordered, awaiting the
-commit reply), Confirmed (committed, eligible), or Dropped (rejected, skip):
+The size-affecting operations — ``OSD_OP_WRITE``, ``OSD_OP_WRITEFULL``,
+``OSD_OP_TRUNCATE``, ``OSD_OP_ZERO``, and MDS ``setattr`` with ``size`` set —
+share a single per-inode ordering point, ordered by ``truncate_seq`` and by
+``user_version`` within a ``truncate_seq`` epoch.
 
 ::
 
-   queue[source_inode] = [event1, event2, event3, ...]   # ordered by token
-
-   replay only from the head:
-       wait until head is Confirmed or Dropped
-       if Dropped:   remove it
-       if Confirmed: emit its path+op record, then remove it
-
-Head-of-queue replay is essential: a later-confirmed write must not pass an
-earlier unconfirmed truncate for the same file.
-
-::
-
-   MDS setattr(size) ----+
-                         |
-   OSD write ------------+--> single logical ordering point
-                         |         |
-   OSD zero -------------+         v
-                            +---------------+
-                            | order by      |
-                            | truncate_seq, |
-                            | user_version  |
-                            +------+--------+
-                                   |
-                                   v
-                            +-------------+
-                            | queue[I]    |
-                            |  10 Obs     |
-                            |  11 Conf    |
-                            |  12 Drop    |
-                            +------+------+
-                                   |
-                                   v
-                            emit ordered path+op records
+   MDS setattr(size) --+
+   OSD_OP_WRITE -------+
+   OSD_OP_WRITEFULL ---+--> single per-inode ordering point,
+   OSD_OP_TRUNCATE ----+    ordered by truncate_seq, then user_version
+   OSD_OP_ZERO --------+
+                       |
+                       v
+              emit ordered path+op records
 
 Bootstrap
 ---------
