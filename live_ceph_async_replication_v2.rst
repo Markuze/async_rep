@@ -732,6 +732,206 @@ included.
                                                                  v
                                                          live replay
 
+Snapshot Checkpoints and RPO
+----------------------------
+
+The live replay stream gives per-file eventual consistency with low lag,
+but does not by itself provide a cross-file consistent recovery point.
+At any moment the replica is a "fuzzy" mirror: each file individually
+reflects the source's committed state, but cross-file relationships may
+be transiently inconsistent — a write to file A may have been replayed
+while a causally subsequent rename of file B has not.
+
+CephFS snapshots close this gap. A snapshot on the source is an atomic,
+cross-file consistent point-in-time. By coordinating a snapshot on both
+clusters and draining the replay pipeline between them, the system
+produces **verified recovery points** with a precisely defined RPO.
+
+Two-tier RPO model
+~~~~~~~~~~~~~~~~~~~
+
+The design offers two recovery tiers:
+
+* **Verified RPO** — the time since the last snapshot checkpoint that
+  has been fully drained and verified on the replica. Recovery to this
+  point guarantees full cross-file consistency. RPO equals the
+  checkpoint interval plus the drain time (typically seconds).
+* **Best-effort RPO** — the pipeline lag of the live replay stream,
+  typically sub-second. Recovery to this point preserves per-file
+  consistency and intra-client causal ordering (see Per-Client Causal
+  Ordering below) but not cross-file point-in-time consistency.
+
+The operator chooses the recovery tier at failover time based on the
+application's consistency requirements.
+
+Checkpoint protocol
+~~~~~~~~~~~~~~~~~~~~
+
+A checkpoint proceeds in five steps:
+
+#. **Initiate.** The orchestrator creates a snapshot on the source
+   subtree being replicated::
+
+      ceph fs snap create <primary_fs> <path> checkpoint_N
+
+   The MDS allocates a new ``snap_id``, journals the snapshot, and
+   sends ``MClientSnap`` notifications to all clients holding caps in
+   the snap realm.
+
+#. **Classify.** Upon observing the ``MClientSnap`` notification in
+   the captured traffic, the gateway uses the ``SnapContext`` carried
+   on each subsequent OSD write to classify it as pre-checkpoint or
+   post-checkpoint. A write whose ``SnapContext.seq`` is less than the
+   new ``snap_id`` belongs to the pre-checkpoint epoch; a write with
+   ``SnapContext.seq`` equal to or greater belongs to the
+   post-checkpoint epoch. This classification is exact — determined by
+   the source-assigned ``SnapContext``, not by wall-clock time or
+   observation order.
+
+#. **Drain.** The gateway holds all post-checkpoint events and waits
+   for every pre-checkpoint event to be replayed and confirmed on the
+   replica. Because data is transferred continuously by the live
+   replay stream, the drain is bounded by in-flight pipeline depth,
+   not by the volume of data written since the last checkpoint. Drain
+   time is typically seconds regardless of how much data changed.
+
+#. **Create replica snapshot.** Once the drain completes, the gateway
+   creates a matching snapshot on the replica::
+
+      ceph fs snap create <replica_fs> <path> checkpoint_N
+
+   The replica's ``checkpoint_N`` now corresponds to the same logical
+   point as the source's ``checkpoint_N``.
+
+#. **Verify (optional).** The system compares the two snapshots to
+   confirm convergence:
+
+   * *Lightweight:* compare recursive statistics (``rstat``) — total
+     file count, total byte count, directory count.
+   * *Standard:* walk both snapshot trees and compare per-file
+     metadata (size, mode, nlink, xattr keys/values).
+   * *Full:* compare file data checksums.
+
+   A passing verification marks the checkpoint as a trusted recovery
+   point.
+
+::
+
+   Primary:
+     ──ops──ops──ops──┃ SNAP-N ┃──ops──ops──ops──┃ SNAP-N+1 ┃──ops──
+                       │                           │
+   Gateway:            │ classify by SnapContext    │
+                       ↓                           ↓
+     ──pre-snap──pre-snap──┃ DRAIN ┃──post-snap────────────────
+                                │
+   Replica:                     ↓
+     ──ops──ops──ops──────┃ SNAP-N' ┃──ops──ops──ops──┃ SNAP-N+1' ┃──
+                           ↑                           ↑
+                      verified                    verified
+                      recovery point              recovery point
+
+SnapContext as the boundary marker
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+CephFS snapshots do not bracket operations with begin/end messages.
+Instead, a single ``MClientSnap`` notification advances the
+``SnapContext`` on every client. From that point forward, each OSD
+write request carries the new ``SnapContext``, and writes that were
+already in flight continue to carry the old one. The ``SnapContext``
+on a write is assigned by the source client, stamped into the OSD
+request, and visible to the capture layer — it is a source-assigned
+token in the same sense as ``user_version`` and ``truncate_seq``.
+
+This means the gateway does not need to correlate the snapshot event
+with wall-clock timestamps or estimate when "all pre-snap writes are
+done." Each individual write self-declares which side of the
+checkpoint boundary it belongs to, and the gateway classifies it
+accordingly.
+
+Performance considerations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A CephFS snapshot triggers ``MClientSnap`` to every client holding
+caps in the snap realm. Each client responds by:
+
+* creating a ``CapSnap`` record for every dirty inode, capturing the
+  inode's current state under the old ``SnapContext``;
+* flushing dirty buffered data to the OSDs under the old
+  ``SnapContext`` before issuing new writes under the new one;
+* sending dirty-cap updates to the MDS.
+
+At the OSD level, the first write after a snapshot to an object that
+was written before the snapshot triggers a copy-on-write clone.
+
+These costs scale with the number of dirty inodes and the volume of
+unflushed data. Frequent root-level snapshots effectively disable
+write buffering and inflate OSD clone overhead. The operational
+guidance is:
+
+* Prefer **subtree-level snapshots** scoped to the replicated path
+  rather than root-level snapshots, so only clients with open files
+  in the replicated subtree are affected.
+* Checkpoint intervals of **5–30 minutes** keep the per-checkpoint
+  overhead low while providing verified recovery points at a useful
+  cadence. The live replay stream provides sub-second best-effort RPO
+  between checkpoints.
+* A policy that bounds maximum pause impact (for example, "checkpoint
+  only when fewer than N inodes are dirty in the realm") is more
+  operationally useful than a fixed interval.
+
+Comparison with snapshot-only replication
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+CephFS snapshot mirroring (``cephfs-mirror``) replicates by
+transferring snapshot diffs — the changed data between two snapshots
+— to the replica. Its RPO is the snapshot interval plus the transfer
+time for the diff. Transfer time grows with the volume of changes
+between snapshots and depends on inter-site bandwidth.
+
+This design's verified RPO is the checkpoint interval plus the drain
+time. Because data is transferred continuously by the live replay
+stream, the drain at checkpoint time is bounded by pipeline depth
+(seconds), not by data volume. This decoupling has two consequences:
+
+* **Shorter achievable checkpoint intervals.** Snapshot mirroring
+  cannot checkpoint faster than its transfer time allows; live replay
+  can checkpoint as fast as its drain completes (seconds), bounded
+  only by the snapshot overhead on the source cluster.
+* **Best-effort RPO between checkpoints.** Snapshot mirroring has no
+  finer-grained recovery point between snapshots. Live replay offers
+  sub-second best-effort recovery at all times, with verified
+  checkpoints at longer intervals.
+
+The trade-off is bandwidth: live replay requires continuous inter-site
+bandwidth equal to the sustained write rate. Snapshot mirroring
+transfers at the average change rate and can absorb write-rate peaks
+between snapshots. Workloads with high peak-to-average write ratios or
+heavy overwrite patterns (where snapshot diffs benefit from write
+coalescing) may transfer less total data with snapshot mirroring.
+
+Per-Client Causal Ordering
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Cross-file causal consistency — for example, a client writes a data
+file, fsyncs, then renames a flag file to signal completion — does
+not require a global serialization point. The causal chain is
+intra-client: the client cannot issue the rename until fsync returns,
+so the rename's MDS request has a strictly later per-session op id
+than the last OSD write confirmed by fsync. The gateway preserves
+this ordering within the per-client session, using the per-session op
+id already carried in the replay records.
+
+For cross-client causality mediated by the filesystem — client A
+creates a flag file, client B stats it and proceeds — the MDS
+serializes the operations and the MDS metadata version / journal
+sequence orders them. Cross-client causality through external channels
+(application-level messaging outside the filesystem) is not preserved,
+which matches the consistency CephFS itself provides.
+
+Per-client session ordering, per-inode token ordering, and MDS
+metadata ordering compose without a single global queue, so ordering
+scales horizontally with client count and gateway sharding.
+
 Future Work
 -----------
 
@@ -792,10 +992,11 @@ Production recovery adds explicit handling for capture-layer and gateway
 failure, replay-log overflow, and missed traffic — fail-closed capture,
 durable logs, bounded dirty sets, selective recopy, and drift detection.
 
-Live verifier on a consistent cut
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Live verifier
+~~~~~~~~~~~~~~
 
-The POC verifies against a quiesced source. A live verifier compares a
-mutating source against a lagging replica using a consistent cut — CephFS
-snapshots or a version-stamped frontier from the same ordering tokens — with
-drift triggering selective recopy.
+The checkpoint mechanism described in Snapshot Checkpoints and RPO provides
+verified recovery points on a quiesced drain. A live verifier extends this
+to a mutating source, comparing the source and replica at the checkpoint
+boundary using the same ``SnapContext``-classified frontier. Drift beyond
+a configured threshold triggers selective recopy of affected files.
